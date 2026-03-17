@@ -54,7 +54,7 @@ class Colors:
 class PDFToMarkdownProcessor:
     """Processor for converting PDF files to Markdown using DeepSeek OCR API with enhanced post-processing"""
     
-    def __init__(self, data_folder: str = "data", api_base_url: str = "http://localhost:8000", 
+    def __init__(self, data_folder: str = "data", api_base_url: str = "http://localhost:18000", 
                  extract_images: bool = True, create_images_folder: bool = True):
         """
         Initialize the PDF processor

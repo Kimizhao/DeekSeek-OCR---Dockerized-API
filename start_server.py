@@ -13,8 +13,8 @@ from typing import List, Optional
 from pathlib import Path
 
 import uvicorn
+import httpx
 from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks, Form
-from typing import Optional
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -111,6 +111,15 @@ def initialize_model():
         
         print("Model initialization complete!")
 
+async def download_file(url: str) -> bytes:
+    """Download a file from a URL"""
+    async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
+        print(f"[DEBUG] Downloading file from: {url}")
+        response = await client.get(url)
+        response.raise_for_status()
+        print(f"[DEBUG] Successfully downloaded {len(response.content)} bytes from {url}")
+        return response.content
+
 def pdf_to_images_high_quality(pdf_data: bytes, dpi: int = 144) -> List[Image.Image]:
     """Convert PDF bytes to high-quality PIL Images"""
     images = []
@@ -140,6 +149,83 @@ def pdf_to_images_high_quality(pdf_data: bytes, dpi: int = 144) -> List[Image.Im
         os.unlink(temp_pdf_path)
     
     return images
+
+def process_image_bytes(image_data: bytes, prompt: Optional[str]) -> OCRResponse:
+    """Run OCR pipeline on raw image bytes and build a response"""
+    # Convert to PIL Image
+    image = Image.open(io.BytesIO(image_data)).convert('RGB')
+    print(f"[DEBUG] Converted to PIL Image, size: {image.size}")
+    
+    # Debug logging
+    print(f"[DEBUG] Received prompt parameter: {repr(prompt)}")
+    print(f"[DEBUG] Default PROMPT from config: {repr(PROMPT)}")
+    
+    # Use provided prompt or default
+    use_prompt = prompt if prompt else PROMPT
+    print(f"[DEBUG] Image processing selected prompt: {repr(use_prompt)}")
+    print(f"[DEBUG] Using custom prompt: {prompt is not None}")
+    
+    # Process with DeepSeek-OCR
+    print(f"[DEBUG] Sending image to DeepSeek-OCR...")
+    result = process_single_image(image, use_prompt)
+    print(f"[DEBUG] OCR complete, output length: {len(result)}")
+    
+    return OCRResponse(
+        success=True,
+        result=result,
+        page_count=1
+    )
+
+def process_pdf_bytes(pdf_data: bytes, prompt: Optional[str], filename: str) -> BatchOCRResponse:
+    """Run OCR pipeline on raw PDF bytes and build a batch response"""
+    print(f"[DEBUG] Received prompt parameter: {repr(prompt)}")
+    print(f"[DEBUG] Default PROMPT from config: {repr(PROMPT)}")
+    
+    # Convert PDF to images
+    images = pdf_to_images_high_quality(pdf_data, dpi=144)
+    print(f"[DEBUG] Converted PDF to {len(images)} images")
+    
+    if not images:
+        print(f"[DEBUG] No images extracted from PDF")
+        return BatchOCRResponse(
+            success=False,
+            results=[],
+            total_pages=0,
+            filename=filename
+        )
+    
+    # Use provided prompt or default
+    use_prompt = prompt if prompt else PROMPT
+    print(f"[DEBUG] PDF processing selected prompt: {repr(use_prompt)}")
+    print(f"[DEBUG] Using custom prompt: {prompt is not None}")
+    
+    # Process each page
+    results = []
+    for page_num, image in enumerate(tqdm(images, desc="Processing pages")):
+        try:
+            print(f"[DEBUG] Processing page {page_num + 1}/{len(images)}")
+            result = process_single_image(image, use_prompt)
+            results.append(OCRResponse(
+                success=True,
+                result=result,
+                page_count=page_num + 1
+            ))
+            print(f"[DEBUG] Page {page_num + 1} processed successfully, output length: {len(result)}")
+        except Exception as e:
+            print(f"[ERROR] Page {page_num + 1} failed: {str(e)}")
+            results.append(OCRResponse(
+                success=False,
+                error=f"Page {page_num + 1} error: {str(e)}",
+                page_count=page_num + 1
+            ))
+    
+    print(f"[DEBUG] PDF processing complete: {len(results)} pages processed")
+    return BatchOCRResponse(
+        success=True,
+        results=results,
+        total_pages=len(images),
+        filename=filename
+    )
 
 def process_single_image(image: Image.Image, prompt: str = PROMPT) -> str:
     """Process a single image with DeepSeek-OCR using the specified prompt"""
@@ -211,29 +297,7 @@ async def process_image_endpoint(file: UploadFile = File(...), prompt: Optional[
         image_data = await file.read()
         print(f"[DEBUG] Read {len(image_data)} bytes of image data")
         
-        # Convert to PIL Image
-        image = Image.open(io.BytesIO(image_data)).convert('RGB')
-        print(f"[DEBUG] Converted to PIL Image, size: {image.size}")
-        
-        # Debug logging
-        print(f"[DEBUG] Received prompt parameter: {repr(prompt)}")
-        print(f"[DEBUG] Default PROMPT from config: {repr(PROMPT)}")
-        
-        # Use provided prompt or default
-        use_prompt = prompt if prompt else PROMPT
-        print(f"[DEBUG] Image endpoint selected prompt: {repr(use_prompt)}")
-        print(f"[DEBUG] Using custom prompt: {prompt is not None}")
-        
-        # Process with DeepSeek-OCR
-        print(f"[DEBUG] Sending image to DeepSeek-OCR...")
-        result = process_single_image(image, use_prompt)
-        print(f"[DEBUG] OCR complete, output length: {len(result)}")
-        
-        return OCRResponse(
-            success=True,
-            result=result,
-            page_count=1
-        )
+        return process_image_bytes(image_data, prompt)
         
     except Exception as e:
         print(f"[ERROR] Image endpoint failed: {str(e)}")
@@ -242,8 +306,25 @@ async def process_image_endpoint(file: UploadFile = File(...), prompt: Optional[
             error=str(e)
         )
 
+@app.post("/ocr/image/url", response_model=OCRResponse)
+async def process_image_url_endpoint(file_url: str = Form(...), prompt: Optional[str] = Form(None)):
+    """Process a single image referenced by URL with optional custom prompt"""
+    try:
+        print(f"[DEBUG] Image URL endpoint called for: {file_url}")
+        image_data = await download_file(file_url)
+        return process_image_bytes(image_data, prompt)
+    except Exception as e:
+        print(f"[ERROR] Image URL endpoint failed: {str(e)}")
+        return OCRResponse(
+            success=False,
+            error=str(e)
+        )
+
 @app.post("/ocr/pdf", response_model=BatchOCRResponse)
-async def process_pdf_endpoint(file: UploadFile = File(...), prompt: Optional[str] = Form(None)):
+async def process_pdf_endpoint(
+    file: UploadFile = File(...), 
+    prompt: Optional[str] = Form(None)
+):
     """Process a PDF file with optional custom prompt"""
     try:
         print(f"[DEBUG] PDF endpoint called for file: {file.filename}")
@@ -254,51 +335,7 @@ async def process_pdf_endpoint(file: UploadFile = File(...), prompt: Optional[st
         pdf_data = await file.read()
         print(f"[DEBUG] Read {len(pdf_data)} bytes of PDF data")
         
-        # Convert PDF to images
-        images = pdf_to_images_high_quality(pdf_data, dpi=144)
-        print(f"[DEBUG] Converted PDF to {len(images)} images")
-        
-        if not images:
-            print(f"[DEBUG] No images extracted from PDF")
-            return BatchOCRResponse(
-                success=False,
-                results=[],
-                total_pages=0,
-                filename=file.filename
-            )
-        
-        # Use provided prompt or default
-        use_prompt = prompt if prompt else PROMPT
-        print(f"[DEBUG] PDF endpoint selected prompt: {repr(use_prompt)}")
-        print(f"[DEBUG] Using custom prompt: {prompt is not None}")
-        
-        # Process each page
-        results = []
-        for page_num, image in enumerate(tqdm(images, desc="Processing pages")):
-            try:
-                print(f"[DEBUG] Processing page {page_num + 1}/{len(images)}")
-                result = process_single_image(image, use_prompt)
-                results.append(OCRResponse(
-                    success=True,
-                    result=result,
-                    page_count=page_num + 1
-                ))
-                print(f"[DEBUG] Page {page_num + 1} processed successfully, output length: {len(result)}")
-            except Exception as e:
-                print(f"[ERROR] Page {page_num + 1} failed: {str(e)}")
-                results.append(OCRResponse(
-                    success=False,
-                    error=f"Page {page_num + 1} error: {str(e)}",
-                    page_count=page_num + 1
-                ))
-        
-        print(f"[DEBUG] PDF processing complete: {len(results)} pages processed")
-        return BatchOCRResponse(
-            success=True,
-            results=results,
-            total_pages=len(images),
-            filename=file.filename
-        )
+        return process_pdf_bytes(pdf_data, prompt, file.filename)
         
     except Exception as e:
         print(f"[ERROR] PDF endpoint failed: {str(e)}")
@@ -309,8 +346,28 @@ async def process_pdf_endpoint(file: UploadFile = File(...), prompt: Optional[st
             filename=file.filename
         )
 
+@app.post("/ocr/pdf/url", response_model=BatchOCRResponse)
+async def process_pdf_url_endpoint(file_url: str = Form(...), prompt: Optional[str] = Form(None)):
+    """Process a PDF located at a URL with optional custom prompt"""
+    try:
+        print(f"[DEBUG] PDF URL endpoint called for: {file_url}")
+        pdf_data = await download_file(file_url)
+        filename = file_url.split('/')[-1] or "remote_file.pdf"
+        return process_pdf_bytes(pdf_data, prompt, filename)
+    except Exception as e:
+        print(f"[ERROR] PDF URL endpoint failed: {str(e)}")
+        return BatchOCRResponse(
+            success=False,
+            results=[OCRResponse(success=False, error=str(e))],
+            total_pages=0,
+            filename=file_url
+        )
+
 @app.post("/ocr/batch")
-async def process_batch_endpoint(files: List[UploadFile] = File(...), prompt: Optional[str] = Form(None)):
+async def process_batch_endpoint(
+    files: List[UploadFile] = File(...), 
+    prompt: Optional[str] = Form(None)
+):
     """Process multiple files (images and PDFs) with optional custom prompt"""
     results = []
     
@@ -324,6 +381,40 @@ async def process_batch_endpoint(files: List[UploadFile] = File(...), prompt: Op
             "filename": file.filename,
             "result": result
         })
+    
+    return {"success": True, "results": results}
+
+@app.post("/ocr/batch/url")
+async def process_batch_url_endpoint(file_urls: str = Form(...), prompt: Optional[str] = Form(None)):
+    """Process multiple remote files (images and PDFs) with optional custom prompt"""
+    urls = [u.strip() for u in file_urls.split(',') if u.strip()]
+    if not urls:
+        return {"success": False, "error": "No URLs provided"}
+    
+    results = []
+    for url in urls:
+        try:
+            is_pdf = url.lower().endswith('.pdf') or '.pdf?' in url.lower()
+            if is_pdf:
+                response = await process_pdf_url_endpoint(file_url=url, prompt=prompt)
+            else:
+                response = await process_image_url_endpoint(file_url=url, prompt=prompt)
+            
+            results.append({
+                "url": url,
+                "result": response
+            })
+        except Exception as e:
+            print(f"[ERROR] Batch URL processing failed for {url}: {str(e)}")
+            results.append({
+                "url": url,
+                "result": OCRResponse(success=False, error=str(e)) if not url.lower().endswith('.pdf') else BatchOCRResponse(
+                    success=False,
+                    results=[OCRResponse(success=False, error=str(e))],
+                    total_pages=0,
+                    filename=url
+                )
+            })
     
     return {"success": True, "results": results}
 

@@ -36,19 +36,22 @@ RUN pip install --no-cache-dir \
     easydict \
     addict \
     Pillow \
-    numpy
+    numpyp \
+    -i https://mirrors.aliyun.com/pypi/simple/
 
 # Install additional dependencies for the API server
 RUN pip install --no-cache-dir \
     fastapi==0.104.1 \
     uvicorn[standard]==0.24.0 \
-    python-multipart==0.0.6
+    python-multipart==0.0.6 \
+    httpx==0.25.1 \
+    -i https://mirrors.aliyun.com/pypi/simple/
 
 # Install flash-attn for optimal performance (if not already included)
-RUN pip install --no-cache-dir flash-attn==2.7.3 --no-build-isolation || echo "flash-attn may already be installed"
+RUN pip install --no-cache-dir flash-attn==2.7.3 --no-build-isolation -i https://mirrors.aliyun.com/pypi/simple/ || echo "flash-attn may already be installed"
 
 # Downgrade tokenizers to compatible version if needed
-RUN pip install --no-cache-dir tokenizers==0.13.3 || echo "Using existing tokenizers version"
+RUN pip install --no-cache-dir tokenizers==0.13.3 -i https://mirrors.aliyun.com/pypi/simple/ || echo "Using existing tokenizers version"
 
 # Add the DeepSeek-OCR directory to PYTHONPATH
 ENV PYTHONPATH="/app/DeepSeek-OCR-vllm:${PYTHONPATH}"
